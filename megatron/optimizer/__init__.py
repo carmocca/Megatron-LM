@@ -17,7 +17,7 @@ from apex.optimizers import FusedAdam as Adam
 from apex.optimizers import FusedSGD as SGD
 
 from megatron import get_args
-from megatron.model import LayerNorm
+from megatron.model.fused_layer_norm import MixedFusedLayerNorm as LayerNorm
 
 from .grad_scaler import ConstantGradScaler, DynamicGradScaler
 from .optimizer import Float16OptimizerWithFloat16Params, FP32Optimizer
@@ -44,20 +44,41 @@ def _get_params_for_weight_decay_optimization(modules):
                     [p for n, p in list(module_._parameters.items())
                      if p is not None and n == 'bias'])
 
-    return weight_decay_params, no_weight_decay_params
+    # XXX: temp hack to workaround the crash in apex FusedAdam's multi_tensor_applier
+    #
+    # it crashes when the param count is larger than a certain size which we hit at 200B over 80
+    # A100 gpus - I think around 2.7B per gpu, so halving it works around the issue
+    param_count = len(weight_decay_params['params'])
+    first_half = weight_decay_params['params'][:param_count // 2]
+    second_half = weight_decay_params['params'][param_count // 2:]
+
+    first_half =  { 'params': first_half }
+    second_half = { 'params': second_half }
+
+    return first_half, second_half, no_weight_decay_params
+
+    #return weight_decay_params, no_weight_decay_params
 
 
 def get_megatron_optimizer(model):
     args = get_args()
 
+    if args.cpu_optimizer:
+        raise NotImplementedError('need to add cpu adam')
+
     # Base optimizer.
     param_groups = _get_params_for_weight_decay_optimization(model)
     if args.optimizer == 'adam':
-        optimizer = Adam(param_groups,
-                         lr=args.lr,
-                         weight_decay=args.weight_decay,
-                         betas=(args.adam_beta1, args.adam_beta2),
-                         eps=args.adam_eps)
+        if args.use_bnb_optimizer:
+            import bitsandbytes as bnb
+            adam_optimizer = bnb.optim.Adam8bit
+        else:
+            adam_optimizer = Adam
+        optimizer = adam_optimizer(param_groups,
+                                   lr=args.lr,
+                                   weight_decay=args.weight_decay,
+                                   betas=(args.adam_beta1, args.adam_beta2),
+                                   eps=args.adam_eps)
     elif args.optimizer == 'sgd':
         optimizer = SGD(param_groups,
                         lr=args.lr,
@@ -66,6 +87,9 @@ def get_megatron_optimizer(model):
     else:
         raise Exception('{} optimizer is not supported.'.format(
             args.optimizer))
+
+    if args.deepspeed:
+        return optimizer
 
     # Determine whether the params have main-grad field.
     params_have_main_grad = False

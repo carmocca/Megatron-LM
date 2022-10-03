@@ -24,7 +24,7 @@ from megatron import print_rank_0, is_last_rank
 from megatron import get_tokenizer
 from megatron import mpu
 from megatron.checkpointing import load_checkpoint
-from megatron.model import GPTModel
+from megatron.model.gpt_model import GPTModel
 from megatron.training import get_model
 from megatron.utils import get_ltor_masks_and_position_ids, unwrap_model
 from megatron.p2p_communication import recv_forward, send_forward
@@ -34,8 +34,8 @@ from .datasets import build_dataset
 
 # These are needed to unwrap the model, would be nice to put these in megatron.utils if possible?
 from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
-from megatron.model import DistributedDataParallel as LocalDDP
-from megatron.model import Float16Module
+from megatron.model.distributed import DistributedDataParallel as LocalDDP
+from megatron.model.module import Float16Module
 
 def get_model_provider(eval_metric):
     """Based on evaluation metric set the parallel-output flag and
@@ -71,13 +71,16 @@ def process_batch(batch):
     labels = tokens_[:, 1:].contiguous()
     tokens = tokens_[:, :-1].contiguous()
 
-    # Get the masks and postition ids.
+    # Get the masks and position ids.
     attention_mask, _, position_ids = get_ltor_masks_and_position_ids(
         tokens,
         tokenizer.eod,
         args.reset_position_ids,
         args.reset_attention_mask,
-        args.eod_mask_loss)
+        args.eod_mask_loss,
+        prefix_indices=None,
+        loss_on_targets_only=args.loss_on_targets_only
+    )
 
     return tokens, labels, attention_mask, position_ids, loss_mask
 

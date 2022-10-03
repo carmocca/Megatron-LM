@@ -17,21 +17,29 @@
 import math
 import torch
 import torch.nn.functional as F
+from torch import nn
 
-from megatron import get_args
+from megatron import get_args, logging
 from megatron import mpu
 from .module import MegatronModule
-from megatron.model.enums import AttnMaskType, LayerType, AttnType
-from megatron.model import LayerNorm
+from megatron.enums import AttnMaskType, LayerType, AttnType, PositionEmbeddingType
+from megatron.model.fused_layer_norm import MixedFusedLayerNorm as LayerNorm
 from megatron.model.fused_softmax import FusedScaleMaskSoftmax
 from megatron.model.fused_bias_gelu import bias_gelu_impl
 from megatron.model.utils import attention_mask_func, openai_gelu, erf_gelu
+
+import deepspeed
+
+from .glu_activations import GLU_ACTIVATIONS
+from .positional_embeddings import RotaryEmbedding, apply_rotary_pos_emb_torch, apply_rotary_pos_emb
 
 # flags required to enable jit fusion kernels
 torch._C._jit_set_profiling_mode(False)
 torch._C._jit_set_profiling_executor(False)
 torch._C._jit_override_can_fuse_on_cpu(True)
 torch._C._jit_override_can_fuse_on_gpu(True)
+
+logger = logging.get_logger(__name__)
 
 """ We use the following notation throughout this file:
      h: hidden size
@@ -61,17 +69,20 @@ class ParallelMLP(MegatronModule):
         super(ParallelMLP, self).__init__()
         args = get_args()
 
-        # Project to 4h.
+        # Project to ffn_hidden_size
         self.dense_h_to_4h = mpu.ColumnParallelLinear(
             args.hidden_size,
-            args.ffn_hidden_size,
+            # GLU is a special activation that divides the dimension by a factor 2.
+            2 * args.ffn_hidden_size if args.glu_activation else args.ffn_hidden_size,
             gather_output=False,
             init_method=init_method,
             skip_bias_add=True)
 
         self.bias_gelu_fusion = args.bias_gelu_fusion
         self.activation_func = F.gelu
-        if args.openai_gelu:
+        if args.glu_activation:
+            self.activation_func = GLU_ACTIVATIONS[args.glu_activation]
+        elif args.openai_gelu:
             self.activation_func = openai_gelu
         elif args.onnx_safe:
             self.activation_func = erf_gelu
@@ -117,6 +128,7 @@ class ParallelAttention(MegatronModule):
         args = get_args()
         self.fp16 = args.fp16
         self.bf16 = args.bf16
+        self.position_embedding_type = args.position_embedding_type
 
         self.apply_query_key_layer_scaling = args.apply_query_key_layer_scaling
         self.attention_softmax_in_fp32 = args.attention_softmax_in_fp32
@@ -185,8 +197,16 @@ class ParallelAttention(MegatronModule):
             init_method=output_layer_init_method,
             skip_bias_add=True)
 
+        if deepspeed.checkpointing.is_configured():
+            global get_cuda_rng_tracker, checkpoint
+            get_cuda_rng_tracker = deepspeed.checkpointing.get_cuda_rng_tracker
+            checkpoint = deepspeed.checkpointing.checkpoint
+
+        if self.position_embedding_type == PositionEmbeddingType.rotary:
+            self.rotary_emb = RotaryEmbedding(self.hidden_size_per_attention_head, precision=args.params_dtype)
+
     def forward(self, hidden_states, attention_mask, layer_past=None,
-                get_key_value=False, encoder_output=None):
+                get_key_value=False, encoder_output=None, alibi=None):
         # hidden_states: [sq, b, h]
 
         # =====================
@@ -260,29 +280,60 @@ class ParallelAttention(MegatronModule):
                                    output_size[0] * output_size[1], -1)
 
         # preallocting result tensor: [b * np, sq, sk]
-        matmul_result = torch.empty(
-            output_size[0]*output_size[1],
-            output_size[2],
-            output_size[3],
-            dtype=query_layer.dtype,
-            device=torch.cuda.current_device())
+        if alibi is None:
+            matmul_result = torch.empty(
+                output_size[0]*output_size[1],
+                output_size[2],
+                output_size[3],
+                dtype=query_layer.dtype,
+                device=torch.cuda.current_device())
+        else:
+            matmul_result = alibi[:output_size[0]*output_size[1], :, :output_size[3]]
+
+        # Rotary embeddings
+        if self.position_embedding_type == PositionEmbeddingType.rotary:
+            apply_rotary_fn = apply_rotary_pos_emb_torch if self.bf16 else apply_rotary_pos_emb
+
+            seq_len = key_layer.shape[0]
+            offset = 0
+            if layer_past is not None and layer_past.numel() > 0:
+                offset = layer_past[0].shape[0]
+                seq_len += offset
+            cos, sin = self.rotary_emb(value_layer, seq_len=seq_len)
+            query_layer, key_layer = apply_rotary_fn(query_layer, key_layer, cos, sin, offset=offset)
 
         # Raw attention scores. [b * np, sq, sk]
-        matmul_result = torch.baddbmm(
-            matmul_result,
-            query_layer.transpose(0, 1),   # [b * np, sq, hn]
-            key_layer.transpose(0, 1).transpose(1, 2),  # [b * np, hn, sk]
-            beta=0.0, alpha=(1.0/self.norm_factor))
+        if alibi is None:
+            matmul_result = torch.baddbmm(
+                matmul_result,
+                query_layer.transpose(0, 1),   # [b * np, sq, hn]
+                key_layer.transpose(0, 1).transpose(1, 2),  # [b * np, hn, sk]
+                beta=0.0, alpha=(1.0/self.norm_factor))
+        else:
+            if not hasattr(self, "logged_alibi"):
+                logger.debug("Using Alibi.")
+                self.logged_alibi = True
+
+            if self.apply_query_key_layer_scaling:
+                beta = 1.0 / self.layer_number
+            else:
+                beta = 1.0
+
+            matmul_result = torch.baddbmm(
+                matmul_result,
+                query_layer.transpose(0, 1),  # [b * np, sq, hn]
+                key_layer.transpose(0, 1).transpose(1, 2),  # [b * np, hn, sk]
+                beta=beta, alpha=(1.0 / self.norm_factor))
 
         # change view to [b, np, sq, sk]
         attention_scores = matmul_result.view(*output_size)
-
         # ==================================================
         # Update attention mask for inference. [b, np, sq, sk]
         # ==================================================
 
         if get_key_value:
             with torch.no_grad():
+                # TODO @thomasw21 Handle case where `attention_mask` is None
                 if layer_past is not None:
                     attention_mask = attention_mask[
                         ...,
@@ -436,6 +487,16 @@ class ParallelTransformerLayer(MegatronModule):
         self.mlp = ParallelMLP(init_method,
                                output_layer_init_method)
 
+        # Alibi
+        if args.position_embedding_type == PositionEmbeddingType.alibi:
+            self.alibi = self._build_alibi_tensor(args.seq_length, args.num_attention_heads, args.micro_batch_size).to(torch.cuda.current_device())
+            if args.params_dtype == torch.float16:
+                self.alibi = self.alibi.to(torch.float16)
+            elif args.params_dtype == torch.bfloat16:
+                self.alibi = self.alibi.to(torch.bfloat16)
+        else:
+            self.alibi = None
+
     def forward(self, hidden_states, attention_mask,
                 encoder_output=None, enc_dec_attn_mask=None,
                 layer_past=None, get_key_value=False):
@@ -448,7 +509,8 @@ class ParallelTransformerLayer(MegatronModule):
             self.self_attention(layernorm_output,
                                 attention_mask,
                                 layer_past=layer_past,
-                                get_key_value=get_key_value)
+                                get_key_value=get_key_value,
+                                alibi=self.alibi)
 
         if get_key_value:
             attention_output, presents = attention_output
@@ -526,6 +588,65 @@ class ParallelTransformerLayer(MegatronModule):
 
         return output
 
+    @staticmethod
+    def _build_alibi_tensor(max_seq_len, num_attention_heads, batch_size):
+        # Based on https://github.com/ofirpress/attention_with_linear_biases/blob/a35aaca144e0eb6b789dfcb46784c4b8e31b7983/fairseq/models/transformer.py#L742
+        """Returns tensor shaped (batch_size * num_attention_heads, 1, max_seq_len)"""
+
+        def get_slopes(n):
+            def get_slopes_power_of_2(n):
+                start = (2 ** (-2 ** -(math.log2(n) - 3)))
+                ratio = start
+                return [start * ratio ** i for i in range(n)]
+
+            if math.log2(n).is_integer():
+                return get_slopes_power_of_2(n)
+            else:
+                closest_power_of_2 = 2 ** math.floor(math.log2(n))
+                return get_slopes_power_of_2(closest_power_of_2) + get_slopes(2 * closest_power_of_2)[0::2][
+                                                                   :n - closest_power_of_2]
+
+        slopes = torch.Tensor(get_slopes(num_attention_heads))
+        alibi = slopes.unsqueeze(1).unsqueeze(1) * torch.arange(max_seq_len).unsqueeze(0).unsqueeze(0).expand(
+            num_attention_heads, -1, -1)
+        
+        #Select the part of the tensor that corresponds to our tensor parallel index.
+        tp_world_size = mpu.get_tensor_model_parallel_world_size()
+        tp_index = mpu.get_tensor_model_parallel_rank()
+        alibi = alibi.reshape((tp_world_size, -1, *alibi.shape[1:]))[tp_index]
+        
+        alibi = alibi.repeat(batch_size, 1, 1)
+        return alibi
+
+class ParallelTransformerLayerPipe(ParallelTransformerLayer):
+    """Extends ParallelTransformerLayer to forward attention_mask through the pipeline.
+
+    Forward has two usages that affect attention mask communication:
+
+    1) forward((input, attn_mask) , **kwargs) -> (output, mask)
+       When the attention mask is provided as the second positional
+       argument, typical pipeline behavior is used and both the output
+       *and* mask are returned in a tuple. This tuple is then forwarded
+       to the next stage in the pipeline.
+
+       This version is useful if masks are dynamic.
+    
+    2) forward(input, **kwargs) -> output
+       When the mask is static over all samples, it is advantageous to
+       cache the mask and avoid communicating it.
+    """
+    def forward(self, inputs, **kwargs):
+        assert torch.is_tensor(inputs) or isinstance(inputs, tuple)
+        if torch.is_tensor(inputs) or len(inputs) == 1:
+            hidden_states, attention_mask = inputs, None
+            return super().forward(hidden_states, attention_mask, **kwargs)
+        elif len(inputs) == 2:
+            # Attention mask is an activation.
+            hidden_states, attention_mask = inputs[0], inputs[1]
+            return super().forward(*inputs, **kwargs), attention_mask
+        else:
+            raise RuntimeError('Received more inputs than understood.')
+
 
 class ParallelTransformer(MegatronModule):
     """Transformer class."""
@@ -590,6 +711,11 @@ class ParallelTransformer(MegatronModule):
             self.final_layernorm = LayerNorm(
                 args.hidden_size,
                 eps=args.layernorm_epsilon)
+
+        if deepspeed.checkpointing.is_configured():
+            global get_cuda_rng_tracker, checkpoint
+            get_cuda_rng_tracker = deepspeed.checkpointing.get_cuda_rng_tracker
+            checkpoint = deepspeed.checkpointing.checkpoint
 
     def _get_layer(self, layer_number):
         return self.layers[layer_number]

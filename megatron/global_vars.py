@@ -15,9 +15,13 @@
 
 """Megatron global variables."""
 
+import functools
 import os
 import sys
 import time
+
+from packaging import version
+from pathlib import Path
 
 import torch
 
@@ -29,9 +33,9 @@ _GLOBAL_ARGS = None
 _GLOBAL_NUM_MICROBATCHES_CALCULATOR = None
 _GLOBAL_TOKENIZER = None
 _GLOBAL_TENSORBOARD_WRITER = None
+_GLOBAL_CODECARBON_TRACKER = None
 _GLOBAL_ADLR_AUTORESUME = None
 _GLOBAL_TIMERS = None
-
 
 def get_args():
     """Return arguments."""
@@ -63,6 +67,10 @@ def get_tensorboard_writer():
     to check if it is initialized."""
     return _GLOBAL_TENSORBOARD_WRITER
 
+def get_codecarbon_tracker():
+    """Return codecarbon tracker. It can be None so no need
+    to check if it is initialized."""
+    return _GLOBAL_CODECARBON_TRACKER
 
 def get_adlr_autoresume():
     """ADLR autoresume object. It can be None so no need
@@ -83,9 +91,10 @@ def set_global_variables(extra_args_provider=None, args_defaults={},
                        defaults=args_defaults,
                        ignore_unknown_args=ignore_unknown_args)
     _build_num_microbatches_calculator(args)
-    if args.vocab_file:
+    if args.vocab_file or args.tokenizer_name_or_path:
         _ = _build_tokenizer(args)
     _set_tensorboard_writer(args)
+    _set_codecarbon_tracker(args)
     _set_adlr_autoresume(args)
     _set_timers()
 
@@ -139,10 +148,89 @@ def _set_tensorboard_writer(args):
             _GLOBAL_TENSORBOARD_WRITER = SummaryWriter(
                 log_dir=args.tensorboard_dir,
                 max_queue=args.tensorboard_queue_size)
+            # this is supposed to make the data load in TB faster
+            if version.parse(torch.__version__) >= version.parse("1.9"):
+                _GLOBAL_TENSORBOARD_WRITER.add_scalar = functools.partial(
+                    _GLOBAL_TENSORBOARD_WRITER.add_scalar, new_style=True
+                )
         except ModuleNotFoundError:
             print('WARNING: TensorBoard writing requested but is not '
                   'available (are you using PyTorch 1.1.0 or later?), '
                   'no TensorBoard logs will be written.', flush=True)
+
+
+# Important: the codecarbon is very unstable and its latest incarnation using the python scheduler interferes with the asyncio library we use in the test suite which breaks everything, so making this a no-op for now.
+def _set_codecarbon_tracker(args):
+
+    return # turned off
+
+    global _GLOBAL_CODECARBON_TRACKER
+    if not hasattr(args, 'codecarbon_dir') or args.codecarbon_dir is None:
+        return
+
+    import codecarbon
+    if args.rank == 0:
+        print('> setting codecarbon ...')
+
+    output_dir = args.codecarbon_dir
+    output_file = f"emissions-{args.rank:03d}.csv"
+    logger_preamble = f"r{args.rank:03d}"
+    log_level = "error"
+    country_iso_code = "FRA"
+
+    # CC was emitting all kinds of warnings about issues with measurements, so the following
+    # settings are supposed to help
+    misfire_grace_time = 3
+    measure_power_secs = 60
+    max_instances = 3
+
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    _GLOBAL_CODECARBON_TRACKER = codecarbon.OfflineEmissionsTracker(
+        output_dir=output_dir,
+        output_file=output_file,
+        logger_preamble=logger_preamble,
+        log_level=log_level,
+        misfire_grace_time=misfire_grace_time,
+        measure_power_secs=measure_power_secs,
+        max_instances=max_instances,
+        country_iso_code=country_iso_code,
+    )
+
+
+def codecarbon_tracker_start():
+
+    return # turned off, see the notes above
+
+    global _GLOBAL_CODECARBON_TRACKER
+    if _GLOBAL_CODECARBON_TRACKER is None:
+        return
+
+    #print("CC START")
+    _GLOBAL_CODECARBON_TRACKER.start()
+
+
+def codecarbon_tracker_stop():
+
+    return # turned off, see the notes above
+
+    global _GLOBAL_CODECARBON_TRACKER
+    if _GLOBAL_CODECARBON_TRACKER is None:
+        return
+
+    #print("CC STOP")
+    _GLOBAL_CODECARBON_TRACKER.stop()
+
+
+def codecarbon_tracker_flush():
+
+    return # turned off, see the notes above
+
+    global _GLOBAL_CODECARBON_TRACKER
+    if _GLOBAL_CODECARBON_TRACKER is None:
+        return
+
+    #print("CC FLUSH")
+    _GLOBAL_CODECARBON_TRACKER.flush()
 
 
 def _set_adlr_autoresume(args):
@@ -244,16 +332,19 @@ class Timers:
         assert normalizer > 0.0
         for name in names:
             value = self.timers[name].elapsed(reset=reset) / normalizer
-            writer.add_scalar(name + '-time', value, iteration)
+            writer.add_scalar(f'time/{name}-time', value, iteration)
 
     def log(self, names, normalizer=1.0, reset=True):
         """Log a group of timers."""
         assert normalizer > 0.0
-        string = 'time (ms)'
+        string = ''
         for name in names:
             elapsed_time = self.timers[name].elapsed(
                 reset=reset) * 1000.0 / normalizer
             string += ' | {}: {:.2f}'.format(name, elapsed_time)
+        if not len(string):
+            return
+        string = 'time (ms)' + string
         if torch.distributed.is_initialized():
             if torch.distributed.get_rank() == (
                     torch.distributed.get_world_size() - 1):

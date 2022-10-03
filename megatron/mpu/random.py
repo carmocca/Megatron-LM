@@ -42,10 +42,14 @@ _CHECKPOINTED_ACTIVATIONS_MEMORY_BUFFER = None
 
 
 def init_checkpointed_activations_memory_buffer():
-    """Initializ the memory buffer for the checkpointed activations."""
+    """Initialize the memory buffer for the checkpointed activations."""
     args = get_args()
 
-    per_layer = args.micro_batch_size * args.max_position_embeddings * \
+    upper_bound_sequence_length = max(
+        args.seq_length if args.seq_length is not None else 0,
+        args.decoder_seq_length if args.decoder_seq_length is not None else 0
+    )
+    per_layer = args.micro_batch_size * upper_bound_sequence_length * \
                 args.hidden_size // args.tensor_model_parallel_size
     assert args.num_layers % args.checkpoint_num_layers == 0, \
         'number of layers is not divisible by checkpoint-num-layers'
@@ -180,6 +184,7 @@ class CudaRNGStatesTracker:
         the original state."""
         # Check if we have added the state
         if name not in self.states_:
+            print(name, self.states_)
             raise Exception('cuda rng state {} is not added'.format(name))
         # Store current rng state.
         orig_cuda_rng_state = torch.cuda.get_rng_state()

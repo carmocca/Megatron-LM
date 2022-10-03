@@ -24,6 +24,7 @@ import torch
 import torch.nn.functional as F
 import torch.nn.init as init
 from torch.nn.parameter import Parameter
+from functools import partial
 
 from .initialize import get_tensor_model_parallel_rank
 from .initialize import get_tensor_model_parallel_world_size
@@ -35,7 +36,9 @@ from .random import get_cuda_rng_tracker
 from .utils import divide
 from .utils import split_tensor_along_last_dim
 from .utils import VocabUtility
-from megatron import get_args
+from ..model.fused_layer_norm import MixedFusedLayerNorm as LayerNorm
+from megatron import get_args, mpu
+import deepspeed.runtime.activation_checkpointing.checkpointing as ds_checkpointing
 
 
 _MODEL_PARALLEL_ATTRIBUTE_DEFAULTS = {'tensor_model_parallel': False,
@@ -85,6 +88,10 @@ def _initialize_affine_weight_gpu(weight, init_method,
                                          dim=partition_dim,
                                          stride=stride)
 
+    if ds_checkpointing.is_configured():
+        global get_cuda_rng_tracker
+        get_cuda_rng_tracker = ds_checkpointing.get_cuda_rng_tracker
+
     with get_cuda_rng_tracker().fork():
         init_method(weight)
 
@@ -126,6 +133,26 @@ def _initialize_affine_weight_cpu(weight, output_size, input_size,
     return None
 
 
+def xavier_uniform_tensor_parallel_(tensor, gain=1., tp_degree=1):
+    r"""
+    This is a modified torch.nn.init.xavier_uniform_ with changes to support
+    partitioned on the vocab size dim embedding with tensor parallel.
+
+    Additional args:
+    - tp_degree: degree of tensor parallel
+
+    Note: the code assumes all partitions are equal in size
+    """
+    # receptive_field_size=1 as dim==2, so we don't need init._calculate_fan_in_and_fan_out
+    fan_out, fan_in = tensor.shape
+    fan_out *= tp_degree # tp splits on num_embeddings dim
+
+    std = gain * math.sqrt(2.0 / float(fan_in + fan_out))
+    a = math.sqrt(3.0) * std  # Calculate uniform bounds from standard deviation
+
+    return torch.nn.init._no_grad_uniform_(tensor, -a, a)
+
+
 class VocabParallelEmbedding(torch.nn.Module):
     """Embedding parallelized in the vocabulary dimension.
 
@@ -143,7 +170,7 @@ class VocabParallelEmbedding(torch.nn.Module):
         # Keep the input dimensions.
         self.num_embeddings = num_embeddings
         self.embedding_dim = embedding_dim
-        # Set the detauls for compatibility.
+        # Set the defaults for compatibility.
         self.padding_idx = None
         self.max_norm = None
         self.norm_type = 2.
@@ -151,7 +178,7 @@ class VocabParallelEmbedding(torch.nn.Module):
         self.sparse = False
         self._weight = None
         self.tensor_model_parallel_size = get_tensor_model_parallel_world_size()
-        # Divide the weight matrix along the vocaburaly dimension.
+        # Divide the weight matrix along the vocabulary dimension.
         self.vocab_start_index, self.vocab_end_index = \
             VocabUtility.vocab_range_from_global_vocab_size(
                 self.num_embeddings, get_tensor_model_parallel_rank(),
@@ -161,6 +188,17 @@ class VocabParallelEmbedding(torch.nn.Module):
 
         # Allocate weights and initialize.
         args = get_args()
+
+        # only the first stage embedding runs this class' forward. The head's embedding does its own
+        # thing, so don't waste memory allocating LN weights.
+        if mpu.is_pipeline_first_stage() and (args.use_bnb_optimizer or args.embed_layernorm):
+            self.norm = LayerNorm(embedding_dim)
+
+        if args.use_bnb_optimizer:
+            # for BNB we ignore the passed init_method and use torch.nn.init.xavier_uniform_
+            # modified to calculate std on the unpartitioned embedding
+            init_method = partial(xavier_uniform_tensor_parallel_, tp_degree=self.tensor_model_parallel_size)
+
         if args.use_cpu_initialization:
             self.weight = Parameter(torch.empty(
                 self.num_embeddings_per_partition, self.embedding_dim,
@@ -175,7 +213,16 @@ class VocabParallelEmbedding(torch.nn.Module):
             _initialize_affine_weight_gpu(self.weight, init_method,
                                           partition_dim=0, stride=1)
 
+        if args.use_bnb_optimizer:
+            from bitsandbytes.optim import GlobalOptimManager
+            GlobalOptimManager.get_instance().override_config(self.weight, 'optim_bits', 32)
+            GlobalOptimManager.get_instance().register_parameters(self.weight)
+
+
     def forward(self, input_):
+        if torch.any(input_ >= self.num_embeddings):
+            raise ValueError(f"There is an input id in the input that is greater than the highest possible input id.\nInput: {input_}\nnum_embeddings: {self.num_embeddings}")
+
         if self.tensor_model_parallel_size > 1:
             # Build the mask.
             input_mask = (input_ < self.vocab_start_index) | \
@@ -184,8 +231,10 @@ class VocabParallelEmbedding(torch.nn.Module):
             masked_input = input_.clone() - self.vocab_start_index
             masked_input[input_mask] = 0
         else:
+            # input_ is garanted to be in the range [0:self.vocab_end_index - self.vocab_start_index] thanks to the first check
             masked_input = input_
-            # Get the embeddings.
+
+        # Get the embeddings.
         output_parallel = F.embedding(masked_input, self.weight,
                                       self.padding_idx, self.max_norm,
                                       self.norm_type, self.scale_grad_by_freq,
@@ -195,6 +244,10 @@ class VocabParallelEmbedding(torch.nn.Module):
             output_parallel[input_mask, :] = 0.0
         # Reduce across all the model parallel GPUs.
         output = reduce_from_tensor_model_parallel_region(output_parallel)
+
+        if hasattr(self, 'norm'):
+            output = self.norm(output)
+
         return output
 
 
@@ -218,7 +271,7 @@ class ColumnParallelLinear(torch.nn.Module):
                                      set to False. It returns the master weights
                                      used for initialization.
         skip_bias_add: This was added to enable performance optimations where bias
-                       can be fused with other elementwise operations. we skip 
+                       can be fused with other elementwise operations. we skip
                        adding bias but instead return it.
     """
 
@@ -256,7 +309,7 @@ class ColumnParallelLinear(torch.nn.Module):
                 device=torch.cuda.current_device(), dtype=args.params_dtype))
             _initialize_affine_weight_gpu(self.weight, init_method,
                                           partition_dim=0, stride=stride)
-            
+
         if bias:
             if args.use_cpu_initialization:
                 self.bias = Parameter(torch.empty(
@@ -286,7 +339,7 @@ class ColumnParallelLinear(torch.nn.Module):
             # All-gather across the partitions.
             output = gather_from_tensor_model_parallel_region(output_parallel)
         else:
-            output = output_parallel 
+            output = output_parallel
         output_bias = self.bias if self.skip_bias_add else None
         return output, output_bias
 
@@ -317,7 +370,7 @@ class RowParallelLinear(torch.nn.Module):
                                      set to False. It returns the master weights
                                      used for initialization.
         skip_bias_add: This was added to enable performance optimations where bias
-                       can be fused with other elementwise operations. we skip 
+                       can be fused with other elementwise operations. we skip
                        adding bias but instead return it.
     """
 
@@ -370,6 +423,7 @@ class RowParallelLinear(torch.nn.Module):
         else:
             self.register_parameter('bias', None)
 
+        self.bias_tp_auto_sync = args.sync_tp_duplicated_parameters
 
 
     def forward(self, input_):
@@ -382,6 +436,10 @@ class RowParallelLinear(torch.nn.Module):
         output_parallel = F.linear(input_parallel, self.weight)
         # All-reduce across all the partitions.
         output_ = reduce_from_tensor_model_parallel_region(output_parallel)
+
+        if self.bias_tp_auto_sync:
+            torch.distributed.all_reduce(self.bias, op=torch.distributed.ReduceOp.AVG, group=mpu.get_tensor_model_parallel_group())
+
         if not self.skip_bias_add:
             output = output_ + self.bias if self.bias is not None else output_
             output_bias = None
@@ -389,4 +447,3 @@ class RowParallelLinear(torch.nn.Module):
             output = output_
             output_bias = self.bias
         return output, output_bias
-

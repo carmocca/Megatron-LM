@@ -16,9 +16,18 @@
 """Megatron arguments."""
 
 import argparse
+import collections
 import os
+import re
+import time
 
 import torch
+import deepspeed
+
+from megatron.enums import PositionEmbeddingType
+import megatron
+from megatron.logging import log_levels
+
 
 def parse_args(extra_args_provider=None, defaults={},
                ignore_unknown_args=False):
@@ -41,10 +50,15 @@ def parse_args(extra_args_provider=None, defaults={},
     parser = _add_biencoder_args(parser)
     parser = _add_vit_args(parser)
     parser = _add_logging_args(parser)
+    parser = _add_zero_args(parser)
+    parser = _add_memoryopt_args(parser)
+    parser = _add_activation_checkpoint_args(parser)
 
     # Custom arguments.
     if extra_args_provider is not None:
         parser = extra_args_provider(parser)
+
+    parser = deepspeed.add_config_arguments(parser)
 
     # Parse.
     if ignore_unknown_args:
@@ -80,6 +94,32 @@ def parse_args(extra_args_provider=None, defaults={},
                   args.world_size, args.data_parallel_size,
                   args.tensor_model_parallel_size,
                   args.pipeline_model_parallel_size), flush=True)
+
+    # --data-path and --train-weighted-splits-paths
+    message = "Data loading Mode 1: --data-path and --split "\
+            "and Mode 2: --(train|valid|test)-weighted-split-paths"\
+            "are mutually exclusive i.e. cannot be set together."
+
+    if args.data_path:
+        assert args.train_weighted_split_paths is None, message
+        setattr(args, "valid_weighted_split_names", None)
+        setattr(args, "valid_weighted_split_weights", None)
+        setattr(args, "valid_weighted_split_splits", None)
+
+        setattr(args, "test_weighted_split_names", None)
+        setattr(args, "test_weighted_split_weights", None)
+        setattr(args, "test_weighted_split_splits", None)
+
+        # args.split default value in the args is None it is set here in order
+        # to check that it does not to overlap with the 2nd mode of data loading
+        if args.split is None:
+            args.split = "969, 30, 1"
+
+    if args.train_weighted_split_paths or args.valid_weighted_split_paths or \
+                args.test_weighted_split_paths:
+        assert args.data_path is None and args.split is None, message
+
+
 
     # Deprecated arguments
     assert args.batch_size is None, '--batch-size argument is no longer ' \
@@ -160,6 +200,8 @@ def parse_args(extra_args_provider=None, defaults={},
     # Consumed tokens.
     args.consumed_train_samples = 0
     args.consumed_valid_samples = 0
+    args.consumed_train_tokens = 0
+    args.gigaflos_no_embeds = 0
 
     # Iteration-based training.
     if args.train_iters:
@@ -193,8 +235,7 @@ def parse_args(extra_args_provider=None, defaults={},
                 'and lr-warmup-samples'
 
     # Check required arguments.
-    required_args = ['num_layers', 'hidden_size', 'num_attention_heads',
-                     'max_position_embeddings']
+    required_args = ['num_layers', 'hidden_size', 'num_attention_heads']
     for req_arg in required_args:
         _check_arg_is_not_none(args, req_arg)
 
@@ -213,10 +254,15 @@ def parse_args(extra_args_provider=None, defaults={},
         assert args.encoder_seq_length is not None
         args.seq_length = args.encoder_seq_length
 
-    if args.seq_length is not None:
-        assert args.max_position_embeddings >= args.seq_length
-    if args.decoder_seq_length is not None:
-        assert args.max_position_embeddings >= args.decoder_seq_length
+    if args.position_embedding_type == PositionEmbeddingType.absolute or args.position_embedding_type == PositionEmbeddingType.alibi:
+        assert args.max_position_embeddings is not None
+        if args.seq_length is not None:
+            assert args.max_position_embeddings >= args.seq_length
+        if args.decoder_seq_length is not None:
+            assert args.max_position_embeddings >= args.decoder_seq_length
+    else:
+        assert args.max_position_embeddings is None
+
     if args.lr is not None:
         assert args.min_lr <= args.lr
     if args.save is not None:
@@ -233,6 +279,43 @@ def parse_args(extra_args_provider=None, defaults={},
             'for distribute-checkpointed-activations to work you '\
             'need to enable checkpoint-activations'
 
+    args.curriculum_learning = False
+
+    # Activation function
+    if args.glu_activation is not None and args.bias_gelu_fusion:
+        raise ValueError("if glu-activation is used, please set --no-bias-gelu-fusion")
+
+    # Skip train iterations
+    if args.skip_train_iteration_range is not None:
+        args.skip_train_iteration_range = [
+            list(map(int, range_.split("-"))) for range_ in args.skip_train_iteration_range
+        ]
+        args.skip_train_iteration_range.sort()
+        skip_train_iteration_range = collections.deque()
+        for range_ in args.skip_train_iteration_range:
+            if len(range_) == 2:
+                start, end = range_
+                assert end >= start, \
+                "end of skip range cannot be smaller than start of skip range"
+                # merge overlapping intervals (e.g. 1-5 2-6 -> 1-6)
+                if not skip_train_iteration_range:
+                    skip_train_iteration_range.append([start, end])
+                elif skip_train_iteration_range[-1][1] >= start:
+                    skip_train_iteration_range[-1][1] = max(end, skip_train_iteration_range[-1][1])
+                else:
+                    skip_train_iteration_range.append([start, end])
+            else:
+                raise ValueError(
+                    "skip train iterations should be specified as two numbers, i.e. start-end"
+                )
+        args.skip_train_iteration_range = skip_train_iteration_range
+
+    if args.use_bnb_optimizer:
+        try:
+            import bitsandbytes as bnb
+        except ModuleNotFoundError:
+            raise ModuleNotFoundError("Please install bitsandbytes from https://github.com/facebookresearch/bitsandbytes.")
+
     _print_args(args)
     return args
 
@@ -246,8 +329,15 @@ def _print_args(args):
         for arg in vars(args):
             dots = '.' * (48 - len(arg))
             str_list.append('  {} {} {}'.format(arg, dots, getattr(args, arg)))
-        for arg in sorted(str_list, key=lambda x: x.lower()):
-            print(arg, flush=True)
+
+        if args.log_path is not None:
+            with open(os.path.join(args.log_path,f'args_{time.strftime("%Y-%m-%dT%H:%M:%S")}.txt'), 'w') as f:
+                for arg in sorted(str_list, key=lambda x: x.lower()):
+                    f.write(arg+"\n")
+                    print(arg, flush=True)
+        else:
+            for arg in sorted(str_list, key=lambda x: x.lower()):
+                print(arg, flush=True)
         print('-------------------- end of arguments ---------------------',
               flush=True)
 
@@ -279,12 +369,22 @@ def _add_network_size_args(parser):
     group.add_argument('--make-vocab-size-divisible-by', type=int, default=128,
                        help='Pad the vocab size to be divisible by this value.'
                        'This is added for computational efficieny reasons.')
+    group.add_argument('--pad-vocab-size-to', type=int, default=None,
+                       help='Pad the vocab size to this value.'
+                       'This value must be greater than the initial size of the tokenizer'
+                       ', needs to be divisible by TP size and `make-vocab-size-divisible-by`.')
     group.add_argument('--layernorm-epsilon', type=float, default=1e-5,
                        help='Layer norm epsilon.')
+    group.add_argument('--sync-tp-duplicated-parameters', action='store_true',
+                       help='Force syncing duplicated params across TP ranks in forward. '
+                       'This is a workaround for an unresolved bug leading to TP ranks '
+                       'getting out of sync with each other.')
     group.add_argument('--apply-residual-connection-post-layernorm',
                        action='store_true',
                        help='If set, use original BERT residula connection '
                        'ordering.')
+    group.add_argument('--embed-layernorm', action='store_true',
+                       help='use layernorm for embedding')
     group.add_argument('--openai-gelu', action='store_true',
                        help='Use OpenAIs GeLU implementation. This option'
                        'should not be used unless for backward compatibility'
@@ -295,7 +395,29 @@ def _add_network_size_args(parser):
     group.add_argument('--bert-no-binary-head', action='store_false',
                        help='Disable BERT binary head.',
                        dest='bert_binary_head')
+    group.add_argument('--position-embedding-type', type=lambda x: PositionEmbeddingType[x],
+                       choices=list(PositionEmbeddingType),
+                       default=PositionEmbeddingType.absolute,
+                       help='Define position embedding type ("absolute" | "rotary" | "alibi"). "absolute" by default.'
+                       )
+    group.add_argument('--glu-activation', type=str,
+                       choices=megatron.model.glu_activations.GLU_ACTIVATIONS.keys(),
+                       help='GLU activations to use.'
+                       )
 
+    group.add_argument('--kill-switch-path', type=str,
+                       help='path to look for a kill switch, which if found will automatically exit the program'
+                       )
+
+
+    group.add_argument('--log-level', type=str, choices=list(log_levels.keys()),
+                       help="Logger log level to use on the main process. Possible choices are the log levels as strings: 'debug', "
+                       "'info', 'warning', 'error' and 'critical', plus a 'passive' level which doesn't set anything and lets the "
+                       "application set the level."
+                       )
+    group.add_argument('--log-level-replica', type=str, choices=list(log_levels.keys()),
+                       help="Logger log level to use on replicas. Same choices as ``log_level``"
+                       )
     return parser
 
 
@@ -378,14 +500,14 @@ def _add_training_args(parser):
     group.add_argument('--rampup-batch-size', nargs='*', default=None,
                        help='Batch size ramp up with the following values:'
                        '  --rampup-batch-size <start batch size> '
-                       '                      <batch size incerement> '
+                       '                      <batch size increment> '
                        '                      <ramp-up samples> '
-                       'For example:'
-                       '   --rampup-batch-size 16 8 300000 \ '
-                       '   --global-batch-size 1024'
+                       'For example: '
+                       '   --rampup-batch-size 16 8 300000 '
+                       '   --global-batch-size 1024 '
                        'will start with global batch size 16 and over '
-                       ' (1024 - 16) / 8 = 126 intervals will increase'
-                       'the batch size linearly to 1024. In each interval'
+                       ' (1024 - 16) / 8 = 126 intervals will increase '
+                       'the batch size linearly to 1024. In each interval '
                        'we will use approximately 300000 / 126 = 2380 samples.')
     group.add_argument('--checkpoint-activations', action='store_true',
                        help='Checkpoint activation to allow for training '
@@ -404,6 +526,9 @@ def _add_training_args(parser):
                        help='Total number of samples to train over all '
                        'training runs. Note that either train-iters or '
                        'train-samples should be provided.')
+    group.add_argument('--train-tokens', type=int, default=None,
+                       help='Total number of tokens to train over all '
+                       'training runs.')
     group.add_argument('--log-interval', type=int, default=100,
                        help='Report loss and timing interval.')
     group.add_argument('--exit-interval', type=int, default=None,
@@ -427,9 +552,32 @@ def _add_training_args(parser):
     group.add_argument('--optimizer', type=str, default='adam',
                        choices=['adam', 'sgd'],
                        help='Optimizer function')
+    group.add_argument('--use-bnb-optimizer', action='store_true',
+                       help='Use bitsandbytes optimizer for efficient training,'
+                       'please refer https://github.com/facebookresearch/bitsandbytes.',
+                       dest='use_bnb_optimizer')
     group.add_argument('--dataloader-type', type=str, default=None,
                        choices=['single', 'cyclic'],
                        help='Single pass vs multiple pass data loader')
+    group.add_argument('--cpu-optimizer', action='store_true',
+                       help='Run optimizer on CPU')
+    group.add_argument('--cpu_torch_adam', action='store_true',
+                       help='Use Torch Adam as optimizer on CPU.')
+    group.add_argument('--codecarbon-dir', type=str, default=None,
+                       help='Write CodeCarbon logs to this directory.')
+    group.add_argument('--eval-only', type=bool, required=False,
+                       help='If set to True, no train step will be performed.'
+                       'and only the evaluation on the `valid` and `test` sets '
+                       'will be performed' )
+    group.add_argument('--skip-train-iteration-range', type=str, nargs='+', default=None,
+                       help='Iteration ranges to skip. The values are one or more dash-separated ranges. e.g., 101-200 251-300.')
+    group.add_argument('--inference', action='store_true',
+                       help='Very basic inference mode: not allocating optim/lr - requires ZERO_STAGE=0')
+    group.add_argument('--abort-on-unmet-fused-kernel-constraints', action='store_true',
+                       help="If set to True, the program will abort if the constraints for loading a fused kernel aren't met")
+    group.add_argument('--pp-partition-method', type=str, default=None,
+                       help="Use to override the pipeline stages partitioning method. e.g., 'type:transformer|embedding'")
+
     return parser
 
 
@@ -464,6 +612,9 @@ def _add_learning_rate_args(parser):
     group.add_argument('--lr-decay-samples', type=int, default=None,
                        help='number of samples to decay learning rate over,'
                        ' If None defaults to `--train-samples`')
+    group.add_argument('--lr-decay-tokens', type=int, default=None,
+                       help='number of tokens to decay learning rate over,'
+                       ' If not None will override iter/sample-based decay')
     group.add_argument('--lr-warmup-fraction', type=float, default=None,
                        help='fraction of lr-warmup-(iters/samples) to use '
                        'for warmup (as a float)')
@@ -490,6 +641,8 @@ def _add_learning_rate_args(parser):
                        '(learning rate, warmup iterations, minimum learning '
                        'rate, maximum number of iterations, and decay style '
                        'from checkpoint and ignore input arguments.')
+    group.add_argument('--universal-checkpoint', action='store_true',
+                        help='Loading a universal format checkpoint.')
 
     return parser
 
@@ -612,16 +765,118 @@ def _add_validation_args(parser):
 def _add_data_args(parser):
     group = parser.add_argument_group(title='data and dataloader')
 
+
+    # option 1 for data loading  (mutually exclusive with option2)
     group.add_argument('--data-path', nargs='*', default=None,
                        help='Path to the training dataset. Accepted format:'
                        '1) a single data path, 2) multiple datasets in the'
                        'form: dataset1-weight dataset1-path dataset2-weight '
                        'dataset2-path ...')
-    group.add_argument('--split', type=str, default='969, 30, 1',
+
+    group.add_argument('--split', type=str, default=None,
                        help='Comma-separated list of proportions for training,'
                        ' validation, and test split. For example the split '
                        '`90,5,5` will use 90%% of data for training, 5%% for '
                        'validation and 5%% for test.')
+
+    # option 2 for data loading (mutually exclusive with option1)
+
+    # helper class to parse the --xxx-weighted-split-paths
+    # note here two args are set: extra valid dataset paths and names
+    class parse_data_paths(argparse.Action):
+        def __call__(self, parser, args, values, option_string=None):
+
+            if option_string == "--train-weighted-split-paths":
+                assert len(values) == 1, 'Only 1 dataset group is allowed to'
+                'be passed for the argument --train-weighted-split-paths'
+
+            # make sure string given in the correct format
+            err_message = 'Each data group should be input on the following format'
+            '"GIVEN_NAME WEIGHT1 START:END PATH1, WEIGHT2 START:END PATH2"'
+            'where START < END'
+            for v in values:
+                # each prefix consists several datasets separated by commas
+                prefix = ":".join(v.split(":")[1:]) # remove GIVEN_NAME
+                datasets = prefix.split(",")
+                # check if each dataset is formatted like `WEIGHT START:END PATH`
+                for d in datasets:
+                    assert len(d.split()) == 3, err_message
+                    start, end = d.split()[1].split(":")
+                    assert float(start) < float(end), err_message
+
+            names = [v.split(":")[0] for v in values]
+
+            prefixes = [":".join(v.split(":")[1:]).strip() for v in values]
+            weights = [[d.split()[0] for d in p.split(",")] for p in prefixes]
+            splits = [[d.split()[1] for d in p.split(",")] for p in prefixes]
+            paths = [[d.split()[2] for d in p.split(",")] for p in prefixes]
+
+            # # to keep consistency with Option 1 of data loading (through --data-path)
+            # #  paths will contain strings on the following form
+            # # "WEIGHTS1 PATH1 WEIGHTS2 PATH2 WEIGHTS3 PATH3" for each dataset group
+            # # while data will be parsed in additional arguments below
+            # paths_option1_style = []
+            # for p, w in zip(paths, weights):
+            #   paths_option1_style.append(" ".join([f"{w_i} {p_i}" for p_i, w_i in zip(p,w)]))
+            # setattr(args, self.dest, paths_option1_style)
+            setattr(args, self.dest, paths)
+            setattr(args, self.dest.replace("paths", "weights"), weights)
+            setattr(args, self.dest.replace("paths", "splits"), splits)
+            setattr(args, self.dest.replace("paths","names"), names)
+
+
+    group.add_argument('--train-weighted-split-paths', nargs='*', default=None,
+                    help='Weights, splits and paths to groups of datasets'
+                    'Accepted format: ONE dataset groups could be'
+                    'submitted in the following form between double quotes'
+                    '"GIVEN_NAME WEIGHT1 START:END PATH1, WEIGHT2 START:END PATH2"'
+                    'e.g.: "NAME_ABC: 0.6 0:0.6 A, 0.3 0:1 B, 0.1 0:1 C" '
+                    'WEIGHT is used to up and down sample each dataset A,B,C in the group'
+                    'START:END indicates the split portion of the dataset',
+                    action=parse_data_paths)
+
+    group.add_argument('--valid-weighted-split-paths', nargs='*', default=None,
+                    help='Weights, splits and paths to groups of datasets'
+                    'Accepted format: one or many dataset groups could be'
+                    'submitted in the following form each between double quotes'
+                    '"GIVEN_NAME WEIGHT1 START:END PATH1, WEIGHT2 START:END PATH2"'
+                    'e.g.: "NAME_ABC: 0.6 0.6:0.8 A, 0.3 0:1 B, 0.1 0:1 C" '
+                    '"NAME_CDE: 0.6 0.6:0.8 C, 0.3 0:1 D, 0.1 0:1 E" '
+                    'validation will be run on each of those groups independently',
+                    action=parse_data_paths)
+
+    group.add_argument('--test-weighted-split-paths', nargs='*', default=None,
+                    help='Weights, splits and paths to groups of datasets'
+                    'Accepted format: one or many dataset groups could be'
+                    'submitted in the following form each between double quotes'
+                    '"GIVEN_NAME WEIGHT1 START:END PATH1, WEIGHT2 START:END PATH2"'
+                    'e.g.: "NAME_ABC: 0.6 0.6:0.8 A, 0.3 0:1 B, 0.1 0:1 C" '
+                    '"NAME_CDE: 0.6 0.6:0.8 C, 0.3 0:1 D, 0.1 0:1 E" '
+                    'test will be run on each of those groups independently',
+                    action=parse_data_paths)
+
+    class parse_data_paths_path(argparse.Action):
+        def __call__(self, parser, args, values, option_string=None):
+            expected_option_strings = ["--train-weighted-split-paths-path", "--valid-weighted-split-paths-path", "--test-weighted-split-paths-path"]
+            assert option_string in expected_option_strings, f"Expected {option_string} to be in {expected_option_strings}"
+
+            with open(values, "r") as fi:
+                lines = fi.readlines()
+                assert len(lines) == 1, f"Got multiple lines {len(lines)} instead of 1 expected"
+                assert lines[0][-2:] == "\"\n" and lines[0][0] == "\"", f"Invalid input format, got {lines}"
+                values = lines[0][1:-2].split("\" \"")
+                weighted_split_paths_dest = re.sub(r"_path$", "", self.dest)
+                weighted_split_paths_option = re.sub(r"-path$", "", self.option_strings[0])
+                setattr(args, weighted_split_paths_dest, values)
+                parse_data_paths(option_strings=[weighted_split_paths_option], dest=weighted_split_paths_dest)(parser, args, values, option_string=weighted_split_paths_option)
+
+
+    group.add_argument('--train-weighted-split-paths-path', type=str, action=parse_data_paths_path ,default=None)
+    group.add_argument('--valid-weighted-split-paths-path', type=str, action=parse_data_paths_path, default=None)
+    group.add_argument('--test-weighted-split-paths-path', type=str, action=parse_data_paths_path, default=None)
+
+    group.add_argument('--log-path', type=str, default=None,
+                       help='Path to the save arguments file.')
     group.add_argument('--vocab-file', type=str, default=None,
                        help='Path to the vocab file.')
     group.add_argument('--merge-file', type=str, default=None,
@@ -650,12 +905,17 @@ def _add_data_args(parser):
                        help='Warm up mmap files.')
     group.add_argument('--num-workers', type=int, default=2,
                        help="Dataloader number of workers.")
+    group.add_argument('--valid-num-workers', type=int, default=2,
+                       help="Dataloader number of workers for validation.")
     group.add_argument('--tokenizer-type', type=str,
                        default=None,
                        choices=['BertWordPieceLowerCase',
                                 'BertWordPieceCase',
-                                'GPT2BPETokenizer'],
+                                'GPT2BPETokenizer',
+                                'PretrainedFromHF'],
                        help='What type of tokenizer to use.')
+    group.add_argument("--tokenizer-name-or-path", type=str, default=None,
+                       help="Name or path of the huggingface tokenizer.")
     group.add_argument('--data-impl', type=str, default='infer',
                        choices=['lazy', 'cached', 'mmap', 'infer'],
                        help='Implementation of indexed datasets.')
@@ -663,9 +923,19 @@ def _add_data_args(parser):
                        help='Reset posistion ids after end-of-document token.')
     group.add_argument('--reset-attention-mask', action='store_true',
                        help='Reset self attention maske after '
-                       'end-of-document token.')
+                       'end-of-document token. Attention between tokens from different documents is null.')
     group.add_argument('--eod-mask-loss', action='store_true',
                        help='Mask loss for the end of document tokens.')
+    group.add_argument('--loss-on-targets-only', action='store_true',
+                       help='Mask loss on input sequence.')
+    group.add_argument('--reweight-loss-based-on-position-frequency', action="store_true",
+                       help='Some objectives require us to sample loss_mask. This might introduce bias towards '
+                       'specific positions. This option tries to un-bias the loss by reweighting loss on specific '
+                       'positions based on how frequently we train on that position.'
+                       'This is mostly used for prefix_lm training')
+    group.add_argument("--noise-density", type=float, default=None, help="Span corruption noise density")
+    group.add_argument("--mean-noise-span-length", type=int, default=None, help="Span corruption mean noise span length")
+
 
     return parser
 
@@ -751,4 +1021,60 @@ def _add_vit_args(parser):
     group.add_argument('--patch-dim', type=int, default=16,
                        help='patch dimension used in vit')
 
+    return parser
+
+
+def _add_zero_args(parser):
+    """Text generate arguments."""
+
+    group = parser.add_argument_group('ZeRO configurations', 'configurations')
+    group.add_argument("--zero-stage", type=int, default=1.0)
+    group.add_argument('--zero-reduce-scatter', action='store_true',
+                       help='Use reduce scatter if specified')
+    group.add_argument('--zero-contigious-gradients', action='store_true',
+                       help='Use contigious memory optimizaiton if specified')
+    group.add_argument("--zero-reduce-bucket-size", type=int, default=0.0)
+    group.add_argument("--zero-allgather-bucket-size", type=int, default=0.0)
+    group.add_argument('--remote-device', type=str, default='none', choices=['none', 'cpu', 'nvme'],
+                      help='Remote device for ZeRO-3 initialized parameters.')
+    group.add_argument('--use-pin-memory', action='store_true',
+                     help='Use pinned CPU memory for ZeRO-3 initialized model parameters.')
+    return parser
+
+def _add_memoryopt_args(parser):
+    """Memory optimization arguments."""
+
+    group = parser.add_argument_group('Memory optimizations', 'configurations')
+    group.add_argument("--scattered-embeddings", action='store_true',
+                       help='Save memory by scattering embedding activations. '
+                            'Introduces dropout differences across MP configurations.')
+    group.add_argument("--split-transformers", action='store_true',
+                       help='Save memory by splitting transformer layers into two parts, '
+                       'allowing for more frequent activation checkpoint savings.')
+    group.add_argument("--memory-centric-tiled-linear", action="store_true",
+                       help='Save memory by tiling with deepspeed.zero.TiledLinear.')
+    group.add_argument("--tile-factor", type=int, default=1,
+                       help='Make all linear layers the same size of [hidden/tile_factor, hidden/tile_factor]. '
+                            'Must be enabled with --memory-centric-tiled-linear. '
+                            'Example A: if tile_factor=1, the qkv layer [hidden, 3* hidden] would be converted into [1,3] tiles of size [hidden,hidden]. '
+                            'Example B: if tile_factor=2, the intermediate layer [4*hidden, hidden] will be converted into [8, 2] tiles of size [hidden/2, hidden/2]. '
+                            'Default is 1.')
+
+    return parser
+
+def _add_activation_checkpoint_args(parser):
+    group = parser.add_argument_group('Activation Checkpointing',
+                                      'Checkpointing Configurations')
+    group.add_argument('--deepspeed-activation-checkpointing', action='store_true',
+                       help='uses activation checkpointing from deepspeed')
+    group.add_argument('--partition-activations', action='store_true',
+                       help='partition Activations across GPUs before checkpointing.')
+    group.add_argument('--contigious-checkpointing', action='store_true',
+                       help='Contigious memory checkpointing for activatoins.')
+    group.add_argument('--checkpoint-in-cpu', action='store_true',
+                       help='Move the activation checkpoints to CPU.')
+    group.add_argument('--synchronize-each-layer', action='store_true',
+                       help='does a synchronize at the beginning and end of each checkpointed layer.')
+    group.add_argument('--profile-backward', action='store_true',
+                       help='Enables backward pass profiling for checkpointed layers.')
     return parser

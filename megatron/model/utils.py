@@ -16,6 +16,7 @@
 """Utilities for models."""
 
 import math
+from functools import wraps
 
 import torch
 
@@ -40,7 +41,16 @@ def scaled_init_method_normal(sigma, num_layers):
 
 
 def attention_mask_func(attention_scores, attention_mask):
-    attention_scores.masked_fill_(attention_mask, -10000.0)
+    args = get_args()
+    if args.curriculum_learning:
+        attention_mask_ = attention_mask
+        actual_seqlen = attention_scores.size()[2]
+        if actual_seqlen != attention_mask_.size()[2]:
+            # attention_mask has size [1, 1, seqlen, seqlen]
+            attention_mask_ = attention_mask_[:, :, :actual_seqlen, :actual_seqlen].contiguous()
+        attention_scores.masked_fill_(attention_mask_, torch.finfo(attention_scores.dtype).min)
+    else:
+        attention_scores.masked_fill_(attention_mask, torch.finfo(attention_scores.dtype).min)
     return attention_scores
 
 
@@ -64,3 +74,18 @@ def openai_gelu(x):
 @torch.jit.script
 def erf_gelu(x):
     return x * 0.5 * (torch.erf(x / 1.41421).to(dtype=x.dtype)+torch.ones_like(x).to(dtype=x.dtype))
+
+def log_debug_usage(logger, msg: str):
+    def log_debug_usage_(func):
+        """Helper function in order to log a message when using a function for the first time"""
+        func.__logged_message__ = False
+
+        @wraps(func)
+        def wrapped(*args, **kwargs):
+            if func.__logged_message__ is False:
+                logger.debug(msg)
+                func.__logged_message__ = True
+            return func(*args, **kwargs)
+
+        return wrapped
+    return log_debug_usage_
